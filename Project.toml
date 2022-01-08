@@ -1,0 +1,17 @@
+name = "Wordle"
+uuid = "b333fd8e-ad47-4e0b-9ca3-9c349691cc79"
+authors = ["Mark Hildebrand <mhildebrand@ucdavis.edu>"]
+version = "0.1.0"
+
+[deps]
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
+REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
