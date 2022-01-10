@@ -124,7 +124,7 @@ function (f::Schema)(s::Union{AbstractString,Tuple})
     return true
 end
 
-@enum States::UInt8 Green = 1 Yellow = 2 Gray = 4
+@enum States::UInt8 Gray = 1 Yellow = 2 Green = 4
 function pushincrement!(v::AbstractVector{Tuple{Char,I}}, char) where {I<:Integer}
     j = match(v, char)
     if j === nothing
@@ -199,7 +199,7 @@ function Base.iterate(x::PossibleStates, i = 0)
         i += 1
         (i > 2) && return nothing
     end
-    state = (i == 0) ? Green : (i == 1 ? Yellow : Gray)
+    state = (i == 0) ? Gray : (i == 1 ? Yellow : Green)
     return state, i + 1
 end
 
@@ -327,6 +327,8 @@ end
         possibilities = generate(schema, guess)
         Base.Cartesian.@nloops $N state (j -> possibilities[j]) begin
             states = ($(gather...),)
+            ispossible(schema, guess, states) || continue
+
             result_schema!(tempschema, guess, states)
             merge!(tempschema, schema)
 
