@@ -6,7 +6,7 @@ function newgame(wordlength::Integer, file; hardmode = false)
 end
 
 function newgame(dictionary::Vector{NTuple{N,Char}}; hardmode = false) where {N}
-    schema = Schema()
+    schema = Schema{N}()
     target = DataStructures.OrderedSet(dictionary)
 
     while length(target) > 1

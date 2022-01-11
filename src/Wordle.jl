@@ -16,6 +16,7 @@ using Statistics
 import DataStructures
 import JSON
 import ProgressMeter
+import SIMD
 
 #####
 ##### Dictionary Loading
@@ -43,132 +44,197 @@ end
 tolength(len, words::Vector{String}) = filter(x -> length(x) == len, words)
 
 #####
+##### Utilities
+#####
+
+# Set our vectors to their default state
+function clear!(x::AbstractVector{T}) where {T}
+    @inbounds for i in eachindex(x)
+        x[i] = zero(T)
+    end
+    return x
+end
+
+function clear!(x::AbstractVector{Char})
+    @inbounds for i in eachindex(x)
+        x[i] = ' '
+    end
+end
+
+# Bitmask Utilities
+@inline function isset(v::I, c::Char) where {I <: Integer}
+    return !iszero(v & (one(I) << (c - 'a')))
+end
+@inline set(v::I, c::Char) where {I <: Integer} = v | (one(I) << (c - 'a'))
+
+# Matching
+@inline function unsafe_match(v::AbstractVector{Char}, (char, index)::Tuple{Char,<:Integer})
+    val = @inbounds(v[index])
+    return val == ' ' || val == char
+end
+
+@inline function unsafe_strict_match(v::AbstractVector{Char}, (char, index)::Tuple{Char,<:Integer})
+    return @inbounds(v[index]) == char
+end
+
+@inline function unsafe_match(v::AbstractVector{UInt32}, (char, index)::Tuple{Char,<:Integer})
+    return isset(@inbounds(v[index]), char)
+end
+
+# # Counter Utilities
+# isvalid(x::UInt8) = (x != typemax(UInt8))
+# unsafe_getcount(v::Vector{UInt8}, c::Char) = @inbounds(v[(c - 'a') + 1])
+# function unsafe_inccount!(v::Vector{UInt8}, c::Char)
+#     i = (c - 'a') + 1
+#     val = @inbounds(v[i])
+#     return @inbounds(v[i] = isvalid(val) ? val + one(val) : one(val))
+# end
+#
+# function unsafe_setcount!(v::Vector{UInt8}, count, c::Char)
+#     i = (c - 'a') + 1
+#     return @inbounds(v[i] = count)
+# end
+
+#####
 ##### Discovered Knowledge
 #####
 
-# exact: Exact caracter matches (character, index)
-# misses: Known non-locations (character, index)
-# partial: Partial matches including exact matches (character, count)
-# lacks: Letters not present in the
-struct Schema
-    exact::Vector{Tuple{Char,Int}}
-    misses::Vector{Tuple{Char,Int}}
-    partial::Vector{Tuple{Char,Int}}
-    lacks::Vector{Tuple{Char,Int}}
+mutable struct Schema{N}
+    exact::Vector{Char}
+    misses::Vector{UInt32}
+    lowerbound::SIMD.Vec{32,UInt8}
+    upperbound::SIMD.Vec{32,UInt8}
+    scratch::SIMD.Vec{32,UInt8}
 
     # Inner constructor to ensure everything is sorted.
-    function Schema(exact, misses, partial, lacks)
-        schema = new(exact, misses, partial, lacks)
-        return sort!(schema)
+    function Schema{N}(exact, misses, lowerbound, upperbound, scratch) where {N}
+        schema = new{N}(exact, misses, lowerbound, upperbound, scratch)
+        return empty!(schema)
     end
 end
 
-const TupleCI = Tuple{Char,<:Integer}
-
-_get(::Type{Char}, t::TupleCI) = t[1]
-_get(::Type{<:Integer}, t::TupleCI) = t[2]
-_get(::Type{<:TupleCI}, t::TupleCI) = t
-_get(::T, t::TupleCI) where {T} = _get(T, t)
-
-function Schema(;
-    exact = Tuple{Char,UInt8}[],
-    misses = Tuple{Char,UInt8}[],
-    partial = Tuple{Char,UInt8}[],
-    lacks = Tuple{Char,UInt8}[],
-)
-    return Schema(exact, misses, partial, lacks)
+struct VecPointer
+    ptr::Ptr{UInt8}
 end
 
-function match(v::Vector{<:Tuple{Char,<:Integer}}, x::T) where {T}
-    for i in eachindex(v)
-        _get(T, v[i]) == x && return i
+Base.getindex(x::VecPointer, c::Char) = Base.unsafe_load(x.ptr, c - 'a' + 1)
+Base.setindex!(x::VecPointer, v, c::Char) = Base.unsafe_store!(x.ptr, v, c - 'a' + 1)
+
+@inline function VecPointer(schema::Schema{N}, sym::Symbol) where {N}
+    base = Ptr{UInt8}(Base.pointer_from_objref(schema))
+    if sym == :lowerbound
+        offset = Base.fieldoffset(Schema{N}, 3)
+    elseif sym == :upperbound
+        offset = Base.fieldoffset(Schema{N}, 4)
+    elseif sym == :scratch
+        offset = Base.fieldoffset(Schema{N}, 5)
+    else
+        msg = "Unknown field name $sym"
+        throw(ArgumentError(msg))
     end
-    return nothing
+    return VecPointer(base + offset)
 end
 
+function Schema{N}() where {N}
+    exact = Vector{Char}(undef, N)
+    misses = Vector{UInt32}(undef, N)
+    lowerbound = SIMD.Vec{32,UInt8}(0x00)
+    upperbound = SIMD.Vec{32,UInt8}(0xff)
+    scratch = SIMD.Vec{32,UInt8}(0x00)
+    return Schema{N}(exact, misses, lowerbound, upperbound, scratch)
+end
+
+clearscratch!(schema::Schema) = schema.scratch = SIMD.Vec{32,UInt8}(0x00)
 function Base.empty!(schema::Schema)
-    empty!(schema.exact)
-    empty!(schema.misses)
-    empty!(schema.partial)
-    empty!(schema.lacks)
+    clear!(schema.exact)
+    clear!(schema.misses)
+    schema.lowerbound = SIMD.Vec{32,UInt8}(0x00)
+    schema.upperbound = SIMD.Vec{32,UInt8}(0xff)
+    clearscratch!(schema)
     return schema
 end
 
-function Base.sort!(schema::Schema)
-    sort!(schema.exact; by = last, alg = Base.InsertionSort)
-    sort!(schema.misses; alg = Base.InsertionSort)
-    sort!(schema.partial; alg = Base.InsertionSort)
-    sort!(schema.lacks; alg = Base.InsertionSort)
-    return schema
-end
-
+# Filtering
+compare(f::F, x::SIMD.Vec{32,UInt8}, y::SIMD.Vec{32,UInt8}) where {F} = sum(f(x,y)) == 32
 function (f::Schema)(s::Union{AbstractString,Tuple})
-    (; exact, misses, partial, lacks) = f
-    # First, check exact matches and exact misses
-    for (char, index) in exact
-        s[index] == char || return false
-    end
-    for (char, index) in misses
-        s[index] == char && return false
-    end
+    (; exact, misses, lowerbound, upperbound) = f
+    clearscratch!(f)
+    scratch_pointer = VecPointer(f, :scratch)
 
-    # Next, check partial matches
-    for (char, count) in partial
-        Base.count(isequal(char), s) >= count || return false
-    end
+    # Bit mask for characters processed for bounds checking.
+    for (index, char) in enumerate(s)
+        # If this isn't match a known hit - return false.
+        # If we know this character does not belong at this index, also return false
+        if !unsafe_match(exact, (char, index)) || unsafe_match(misses, (char, index))
+            return false
+        end
 
-    # Finally, check the negative matches
-    for (char, count) in lacks
-        Base.count(isequal(char), s) > count && return false
+        # Increment the character count
+        scratch_pointer[char] += 1
+    end
+    # Perform bounds checks
+    (; scratch) = f
+    if !compare(>=, scratch, lowerbound) || !compare(<=, scratch, upperbound)
+        return false
     end
     return true
 end
 
-@enum States::UInt8 Gray = 1 Yellow = 2 Green = 4
-function pushincrement!(v::AbstractVector{Tuple{Char,I}}, char) where {I<:Integer}
-    j = match(v, char)
-    if j === nothing
-        push!(v, (char, one(I)))
-    else
-        current = v[j]
-        v[j] = (char, current[2] + one(I))
+#__merge(f::F, a::UInt8, b::UInt8) where {F} = isvalid(a) ? (isvalid(b) ? f(a, b) : a) : b
+function merge!(a::Schema{N}, b::Schema{N}) where {N}
+    # Merge exact matches and misses
+    for i in Base.OneTo(N)
+        b_exact = b.exact[i]
+        if b_exact != ' '
+            a.exact[i] = b_exact
+        end
+        a.misses[i] |= b.misses[i]
     end
-    return v
+
+    # Merge upper and lower bounds
+    a.lowerbound = max(a.lowerbound, b.lowerbound)
+    a.upperbound = min(a.upperbound, b.upperbound)
+    return a
 end
+
+#####
+##### Result Logic
+#####
+
+@enum States::UInt8 Gray = 1 Yellow = 2 Green = 4
 
 function result_schema(guess, states::NTuple{N,States}) where {N}
-    return result_schema!(Schema(), guess, states)
+    return result_schema!(Schema{N}(), guess, states)
 end
 
-function result_schema!(schema::Schema, guess, states::NTuple{N,States}) where {N}
+function result_schema!(schema::Schema{N}, guess, states::NTuple{N,States}) where {N}
     empty!(schema)
+    lowerbound = VecPointer(schema, :lowerbound)
+    upperbound = VecPointer(schema, :upperbound)
 
     # Process correct guesses first, then process incorrect guesses.
     # This makes it easier to deal with incorrect guesses that repeat a letter that
     # was correct.
-    for i in eachindex(states)
+    @inbounds for i in Base.OneTo(N)
         state = states[i]
         char = guess[i]
         if state == Green
-            push!(schema.exact, (char, i))
-            pushincrement!(schema.partial, char)
+            schema.exact[i] = char
+            lowerbound[char] += one(UInt8)
         elseif state == Yellow
-            push!(schema.misses, (char, i))
-            pushincrement!(schema.partial, char)
+            schema.misses[i] = set(schema.misses[i], char)
+            lowerbound[char] += one(UInt8)
         end
     end
 
-    for i in eachindex(states)
+    @inbounds for i in Base.OneTo(N)
         state = states[i]
         if state == Gray
             char = guess[i]
-            # Add this to the "misses" list.
-            match(schema.misses, (char, i)) === nothing && push!(schema.misses, (char, i))
-
-            # Keep track of upper bounds for character counts.
-            j = match(schema.partial, char)
-            maxcount = (j === nothing) ? 0 : _get(Int, schema.partial[j])
-            match(schema.lacks, char) === nothing && push!(schema.lacks, (char, maxcount))
+            # Add this to the "misses" list and clamp the upperbound to the exact number
+            # of occurances.
+            schema.misses[i] = set(schema.misses[i], char)
+            upperbound[char] = lowerbound[char]
         end
     end
     return schema
@@ -207,29 +273,25 @@ function generate(schema::Schema, guess::NTuple{N,Char}) where {N}
     return ntuple(Val(N)) do i
         # If this is an exact match, then the only possibility is green.
         char = @inbounds(guess[i])
-        if match(schema.exact, (char, i)) !== nothing
+        if unsafe_strict_match(schema.exact, (char, i))
             return PossibleStates(Green)
         end
 
         # Check if this character is a known non-existant character.
         # This means that there is a max of 0 entries for this character.
         # If so, it can only be Gray.
-        j = match(schema.lacks, char)
-        if j !== nothing
-            _, maxcount = @inbounds(schema.lacks[j])
-            iszero(maxcount) && return PossibleStates(Gray)
+        upperbound = VecPointer(schema, :upperbound)
+        if iszero(upperbound[char])
+            return PossibleStates(Gray)
         end
 
         # Now check if this is forced to be either Gray or Yellow
         # Basically, if we know there is another exact match for this position, than this
         # index cannot be green.
-        if match(schema.exact, i) !== nothing
-            return PossibleStates(Yellow, Gray)
-        end
-
+        #
         # This can also be forced to be either Gray or Yellow if we know this character
         # does not belong in this possition.
-        if match(schema.misses, (char, i)) !== nothing
+        if schema.exact[i] != ' ' || unsafe_match(schema.misses, (char, i))
             return PossibleStates(Yellow, Gray)
         end
 
@@ -249,9 +311,11 @@ function ispossible(
 ) where {N}
     # Bit mask of characters that have been process to avoid repeating work.
     processed = zero(UInt64)
-    for i in Base.OneTo(N)
+    lowerbound = VecPointer(schema, :lowerbound)
+    upperbound = VecPointer(schema, :upperbound)
+    @inbounds for i in Base.OneTo(N)
         char = guess[i]
-        iszero(processed & (one(UInt64) << (Int(char - 'a')))) || continue
+        isset(processed, char) && continue
 
         # Count how many times this character is a match.
         this_count = 0
@@ -264,50 +328,18 @@ function ispossible(
         end
 
         # Make sure the number of occurances lies within our known bounds.
-        # Ensure lower bound.
-        k = match(schema.partial, char)
-        if k !== nothing
-            this_count < _get(Int, schema.partial[k]) && return false
-        end
+        this_count < lowerbound[char] && return false
+        this_count > upperbound[char] && return false
 
-        # Ensure upper Bound.
-        k = match(schema.lacks, char)
-        if k !== nothing
-            this_count > _get(Int, schema.lacks[k]) && return false
-        end
-        processed |= (one(UInt64) << (Int(char - 'a')))
+        # # Ensure upper bound
+        # ub = unsafe_getcount(schema.lacks, char)
+        # if isvalid(ub) && this_count > ub
+        #     return false
+        # end
+
+        processed = set(processed, char)
     end
     return true
-end
-
-#####
-##### Result Iterator
-#####
-
-struct ResultIterator{N,I}
-    schema::Schema
-    guess::NTuple{N,Char}
-    iter::I
-
-end
-
-function ResultIterator(schema::Schema, guess::NTuple{N,Char}) where {N}
-    iter = Iterators.product(generate(schema, guess)...)
-    return ResultIterator(schema, guess, iter)
-end
-
-Base.IteratorSize(::Type{<:ResultIterator}) = Base.SizeUnknown()
-function Base.iterate(r::ResultIterator{T}, s...) where {T}
-    (; schema, guess, iter) = r
-    y = iterate(iter, s...)
-    y === nothing && return nothing
-    (v, t) = y
-    while !ispossible(schema, guess, v)
-        y = iterate(iter, t)
-        y === nothing && return nothing
-        (v, t) = y
-    end
-    return (v, t)
 end
 
 #####
@@ -316,10 +348,10 @@ end
 
 @generated function countmatches(
     f::F,
-    schema::Schema,
+    schema::Schema{N},
     guess::NTuple{N,Char},
     dictionary::Union{AbstractVector,DataStructures.OrderedSet};
-    tempschema::Schema = Schema(),
+    tempschema::Schema = Schema{N}(),
     wordcallback::G = (_...) -> nothing,
 ) where {F,N,G}
     gather = [Symbol("state_$i") for i in Base.OneTo(N)]
@@ -353,15 +385,16 @@ cdiv(a::Integer, b::Integer) = cdiv(promote(a, b)...)
 cdiv(a::T, b::T) where {T<:Integer} = one(T) + div(a - one(T), b)
 
 function process_dictionary(
-    schema::Schema,
+    schema::Schema{N},
     dictionary;
     target = DataStructures.OrderedSet(dictionary),
     batchsize = 16,
-)
+) where {N}
     scores = Vector{Int64}(undef, length(dictionary))
 
     threads = Base.OneTo(Threads.nthreads())
-    tempschema_tls = [Schema() for _ in threads]
+    realschema_tls = [deepcopy(schema) for _ in threads]
+    tempschema_tls = [Schema{N}() for _ in threads]
     seen_tls = [falses(length(target)) for _ in threads]
 
     meter = ProgressMeter.Progress(length(dictionary), 1)
@@ -369,7 +402,10 @@ function process_dictionary(
     workcount = Threads.Atomic{Int}(1)
     numbatches = cdiv(length(dictionary), batchsize)
 
+    #@time for tid in Base.OneTo(Threads.nthreads())
     Threads.@threads for tid in Base.OneTo(Threads.nthreads())
+        maxpartition = Ref(0)
+        aborted = Ref(false)
         while true
             # Get this threads work load
             k = Threads.atomic_add!(workcount, 1)
@@ -378,20 +414,21 @@ function process_dictionary(
             start = (k - 1) * batchsize + 1
             stop = min(k * batchsize, length(dictionary))
 
+            realschema = realschema_tls[tid]
             tempschema = tempschema_tls[tid]
             seen = seen_tls[tid]
 
             # Process this batch
-            for i = start:stop
+            for i in start:stop
                 word = dictionary[i]
                 seen .= false
+                maxpartition[] = 0
+                aborted[] = false
 
                 wordcallback(i) = (seen[i] = true)
-                maxpartition = 0
                 currentbest = best_bound[]
-                aborted = Ref(false)
                 countmatches(
-                    schema,
+                    realschema,
                     word,
                     target;
                     tempschema,
@@ -401,19 +438,19 @@ function process_dictionary(
                         aborted[] = true
                         return false
                     end
-                    maxpartition = max(maxpartition, partitionsize)
+                    maxpartition[] = max(maxpartition[], partitionsize)
                     return true
                 end
 
                 # Handle any words that aren't covered by entering this guess
                 missed = length(target) - count(seen)
-                maxpartition = max(maxpartition, missed)
+                maxpartition_unbox = max(maxpartition[], missed)
 
-                if maxpartition < currentbest && !aborted[]
-                    Threads.atomic_min!(best_bound, maxpartition)
+                if maxpartition_unbox < currentbest && !aborted[]
+                    Threads.atomic_min!(best_bound, maxpartition_unbox)
                 end
 
-                scores[i] = aborted[] ? typemax(eltype(scores)) : maxpartition
+                scores[i] = aborted[] ? typemax(eltype(scores)) : maxpartition_unbox
             end
             ProgressMeter.next!(meter; step = stop - start + 1)
         end
@@ -425,37 +462,6 @@ end
 #####
 ##### Merging two Schema
 #####
-
-counting_merge(a, b) = counting_merge!(copy(a), b)
-function counting_merge!(a, b)
-    for i in eachindex(b)
-        c = b[i]
-        j = match(a, c[1])
-        if j === nothing
-            push!(a, c)
-        elseif c[2] > a[j][2]
-            a[j] = c
-        end
-    end
-    sort!(a; alg = Base.InsertionSort)
-    return a
-end
-
-function merge!(a::Schema, b::Schema)
-    # Add any new exact matches
-    for i in eachindex(b.exact)
-        c = b.exact[i]
-        in(c, a.exact) || push!(a.exact, c)
-    end
-    sort!(a.exact; by = last, alg = Base.InsertionSort)
-
-    # Merge any partial matches as well.
-    # Need to treat this slightly differently because increase in partial match counts
-    # shouldn't get pushed.
-    counting_merge!(a.partial, b.partial)
-    counting_merge!(a.lacks, b.lacks)
-    return a
-end
 
 #####
 ##### Allow for sorting an array based on scores held in another array.
