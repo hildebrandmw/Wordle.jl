@@ -1,25 +1,45 @@
-function newgame(wordlength::Integer, file; hardmode = false)
+tochar(x) = Char.(x)
+touint8(x) = UInt8.(x)
+function newgame(wordlength::Integer, file; hardmode = false, original_guess = nothing)
     # Read in the dictionary and filter the the appropriate length.
-    d = Tuple.(collect.(tolength(wordlength, readwords(file))))
-    @assert isa(d, Vector{NTuple{wordlength,Char}})
-    return newgame(d; hardmode)
+    d = Tuple.(touint8.(collect.(tolength(wordlength, readwords(file)))))
+    @show typeof(d)
+    @assert isa(d, Vector{NTuple{wordlength,UInt8}})
+    if original_guess !== nothing
+        @assert length(original_guess) == wordlength
+        original_guess = Tuple(touint8(collect(original_guess)))
+    end
+    return newgame(d; hardmode, original_guess)
 end
 
-function newgame(dictionary::Vector{NTuple{N,Char}}; hardmode = false) where {N}
+function newgame(
+    dictionary::Vector{NTuple{N,UInt8}};
+    hardmode = false,
+    original_guess = nothing,
+    target = DataStructures.OrderedSet(dictionary),
+) where {N}
     schema = Schema{N}()
-    target = DataStructures.OrderedSet(dictionary)
 
+    first_iteration = true
     while length(target) > 1
         @show length(target)
-        scores = process_dictionary(schema, dictionary; target)
-        sort!(Glue(scores, dictionary))
+        if first_iteration && original_guess !== nothing
+            guess = original_guess
+        else
+            if first_iteration
+                scores = process_dictionary_init(dictionary)
+            else
+                scores = process_dictionary(schema, dictionary; target)
+            end
+            sort!(Glue(scores, dictionary))
 
-        # Display guesses and scores
-        strings = join.(view(dictionary, 1:min(length(dictionary), 10)))
-        first_scores = view(scores, 1:min(length(scores), 10))
-        display(collect(zip(strings, first_scores)))
-        guess = first(dictionary)
-        println("Current Guess: $(join(guess))")
+            # Display guesses and scores
+            strings = join.(tochar.(view(dictionary, 1:min(length(dictionary), 10))))
+            first_scores = view(scores, 1:min(length(scores), 10))
+            display(collect(zip(strings, first_scores)))
+            guess = first(dictionary)
+        end
+        println("Current Guess: $(join(tochar(guess)))")
 
         # Read in how well this guess did.
         local status
@@ -33,7 +53,7 @@ function newgame(dictionary::Vector{NTuple{N,Char}}; hardmode = false) where {N}
                 println(stdout, repr(schema))
                 continue
             elseif status == "show target"
-                foreach(x -> println(join(x)), target)
+                foreach(x -> println(join(tochar(x))), target)
                 retry = true
                 break
             elseif startswith(status, "override ")
@@ -57,8 +77,9 @@ function newgame(dictionary::Vector{NTuple{N,Char}}; hardmode = false) where {N}
         if hardmode
             filter!(schema, dictionary)
         end
+        first_iteration = false
     end
-    return join(only(target))
+    return join(tochar(only(target)))
 end
 
 function validate(N, status)
