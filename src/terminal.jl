@@ -1,19 +1,17 @@
-tochar(x) = Char.(x)
-touint8(x) = UInt8.(x)
 function newgame(wordlength::Integer, file; hardmode = false, original_guess = nothing)
     # Read in the dictionary and filter the the appropriate length.
-    d = Tuple.(touint8.(collect.(tolength(wordlength, readwords(file)))))
+    d = Tuple.(map.(ASCIIChar, collect.((tolength(wordlength, readwords(file))))))
     @show typeof(d)
-    @assert isa(d, Vector{NTuple{wordlength,UInt8}})
+    @assert isa(d, Vector{NTuple{wordlength,ASCIIChar}})
     if original_guess !== nothing
         @assert length(original_guess) == wordlength
-        original_guess = Tuple(touint8(collect(original_guess)))
+        original_guess = Tuple(ASCIIChar.(collect(original_guess)))
     end
     return newgame(d; hardmode, original_guess)
 end
 
 function newgame(
-    dictionary::Vector{NTuple{N,UInt8}};
+    dictionary::Vector{NTuple{N,ASCIIChar}};
     hardmode = false,
     original_guess = nothing,
     target = DataStructures.OrderedSet(dictionary),
@@ -34,12 +32,12 @@ function newgame(
             sort!(Glue(scores, dictionary))
 
             # Display guesses and scores
-            strings = join.(tochar.(view(dictionary, 1:min(length(dictionary), 10))))
+            strings = join.(view(dictionary, 1:min(length(dictionary), 10)))
             first_scores = view(scores, 1:min(length(scores), 10))
             display(collect(zip(strings, first_scores)))
             guess = first(dictionary)
         end
-        println("Current Guess: $(join(tochar(guess)))")
+        println("Current Guess: $(join(guess))")
 
         # Read in how well this guess did.
         local status
@@ -53,7 +51,7 @@ function newgame(
                 println(stdout, repr(schema))
                 continue
             elseif status == "show target"
-                foreach(x -> println(join(tochar(x))), target)
+                foreach(x -> println(join(x)), target)
                 retry = true
                 break
             elseif startswith(status, "override ")
@@ -79,7 +77,7 @@ function newgame(
         end
         first_iteration = false
     end
-    return join(tochar(only(target)))
+    return join(only(target))
 end
 
 function validate(N, status)

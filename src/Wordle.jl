@@ -17,6 +17,7 @@ import DataStructures
 import JSON
 import ProgressMeter
 import SIMD
+import StaticArrays: MVector
 include("simd.jl")
 
 #####
@@ -45,6 +46,51 @@ end
 tolength(len, words::Vector{String}) = filter(x -> length(x) == len, words)
 
 #####
+##### Helpers
+#####
+
+# ASCII Characters
+struct ASCIIChar
+    val::UInt8
+end
+Base.Char(char::ASCIIChar) = Char(char.val)
+Base.show(io::IO, char::ASCIIChar) = show(io, Char(char))
+Base.print(io::IO, char::ASCIIChar) = print(io, Char(char))
+
+ASCIIChar(char::Char) = ASCIIChar(convert(UInt8, char))
+
+const AA = ASCIIChar('a')
+normalize(char::ASCIIChar) = (char - ASCIIChar('a'))
+Base.:-(a::ASCIIChar, b::ASCIIChar) = (a.val - b.val)
+
+Base.zero(::Type{ASCIIChar}) = ASCIIChar(zero(UInt8))
+Base.zero(::ASCIIChar) = zero(ASCIIChar)
+
+Base.iszero(char::ASCIIChar) = iszero(char.val)
+Base.:(==)(a::ASCIIChar, b::ASCIIChar) = (a.val == b.val)
+Base.isless(a::ASCIIChar, b::ASCIIChar) = isless(a.val, b.val)
+
+# Masks
+struct Mask{T}
+    val::T
+end
+Mask{T}() where {T} = Mask{T}(zero(T))
+
+Mask(char::ASCIIChar) = Mask{UInt32}(Base.shl_int(one(UInt32), normalize(char)))
+
+Base.:|(a::Mask{T}, b::Mask{T}) where {T} = Mask{T}(a.val | b.val)
+Base.:|(mask::Mask{UInt32}, char::ASCIIChar) = mask | Mask(char)
+ismatch(a::Mask{T}, b::Mask{T}) where {T} = !iszero(a.val & b.val)
+ismatch(a::Mask{UInt32}, char::ASCIIChar) = ismatch(a, Mask(char))
+
+Base.zero(::Type{Mask{T}}) where {T} = Mask{T}()
+Base.zero(::T) where {T <: Mask} = zero(T)
+
+# SIMD Bridges
+bitifelse(mask::Mask, args...) = bitifelse(mask.val, args...)
+bitunpack(mask::Mask) = bitunpack(mask.val)
+
+#####
 ##### Utilities
 #####
 
@@ -56,31 +102,33 @@ function clear!(x::AbstractVector{T}) where {T}
     return x
 end
 
-function clear!(x::AbstractVector{UInt8})
-    @inbounds for i in eachindex(x)
-        x[i] = 0x00
-    end
-end
-
-# Bitmask Utilities
-const AA = UInt8('a')
-@inline function isset(v::I, c::UInt8) where {I <: Integer}
-    return !iszero(v & (Base.shl_int(one(I), (c - AA))))
-end
-@inline set(v::I, c::UInt8) where {I <: Integer} = v | (Base.shl_int(one(I), (c - AA)))
-
-# Matching
-@inline function unsafe_match(v::AbstractVector{UInt8}, (char, index)::Tuple{UInt8,<:Integer})
+@inline function unsafe_match(
+    v::AbstractVector{ASCIIChar},
+    (char, index)::Tuple{ASCIIChar,<:Integer},
+)
     val = @inbounds(v[index])
     return iszero(val) || val == char
 end
 
-@inline function unsafe_strict_match(v::AbstractVector{UInt8}, (char, index)::Tuple{UInt8,<:Integer})
+@inline function unsafe_strict_match(
+    v::AbstractVector{ASCIIChar},
+    (char, index)::Tuple{ASCIIChar,<:Integer},
+)
     return @inbounds(v[index]) == char
 end
 
-@inline function unsafe_match(v::AbstractVector{UInt32}, (char, index)::Tuple{UInt8,<:Integer})
-    return isset(@inbounds(v[index]), char)
+@inline function unsafe_match(
+    v::AbstractVector{Mask{UInt32}},
+    (mask, index)::Tuple{Mask{UInt32},<:Integer},
+)
+    return ismatch(@inbounds(v[index]), mask)
+end
+
+@inline function unsafe_match(
+    v::AbstractVector{Mask{UInt32}},
+    (char, index)::Tuple{ASCIIChar,<:Integer},
+)
+    return unsafe_match(v, (Mask(char), index))
 end
 
 #####
@@ -88,15 +136,15 @@ end
 #####
 
 mutable struct Schema{N}
-    exact::Vector{UInt8}
-    misses::Vector{UInt32}
+    exact::MVector{N,ASCIIChar}
+    misses::MVector{N,Mask{UInt32}}
     lowerbound::SIMD.Vec{32,UInt8}
     upperbound::SIMD.Vec{32,UInt8}
 end
 
 function Schema{N}() where {N}
-    exact = Vector{UInt8}(undef, N)
-    misses = Vector{UInt32}(undef, N)
+    exact = MVector{N,ASCIIChar}(undef)
+    misses = MVector{N,Mask{UInt32}}(undef)
     lowerbound = SIMD.Vec{32,UInt8}(0x00)
     upperbound = SIMD.Vec{32,UInt8}(0xff)
     schema = Schema{N}(exact, misses, lowerbound, upperbound)
@@ -110,14 +158,8 @@ function Base.empty!(schema::Schema)
     return schema
 end
 
-function Base.show(io::IO, schema::Schema{N}) where {N}
-    print(io, "Wordle.Schema{$N}(", schema.exact, ", ", schema.misses, ", ")
-    print(io, "Wordle.SIMD.Vec{32,UInt8}(", Tuple(schema.lowerbound), "), ")
-    print(io, "Wordle.SIMD.Vec{32,UInt8}(", Tuple(schema.upperbound), "), ")
-end
-
 # Filtering
-compare(f::F, x::SIMD.Vec{32,UInt8}, y::SIMD.Vec{32,UInt8}) where {F} = sum(f(x,y)) == 32
+compare(f::F, x::SIMD.Vec{32,UInt8}, y::SIMD.Vec{32,UInt8}) where {F} = sum(f(x, y)) == 32
 function (f::Schema)(s::Union{AbstractString,Tuple})
     (; exact, misses, lowerbound, upperbound) = f
     scratch = SIMD.Vec{32,UInt8}(0x00)
@@ -131,13 +173,10 @@ function (f::Schema)(s::Union{AbstractString,Tuple})
         end
 
         # Increment the character count
-        scratch += bitunpack(Base.shl_int(one(UInt32), (char - AA)))
+        scratch += bitunpack(Mask(char))
     end
     # Perform bounds checks
-    if !compare(>=, scratch, lowerbound) || !compare(<=, scratch, upperbound)
-        return false
-    end
-    return true
+    return compare(>=, scratch, lowerbound) & compare(<=, scratch, upperbound)
 end
 
 function merge!(a::Schema{N}, b::Schema{N}) where {N}
@@ -165,9 +204,13 @@ function result_schema(guess, states::NTuple{N,States}) where {N}
     return result_schema!(Schema{N}(), guess, states)
 end
 
-function result_schema!(schema::Schema{N}, guess::AbstractString, states::NTuple{N,States}) where {N}
+function result_schema!(
+    schema::Schema{N},
+    guess::AbstractString,
+    states::NTuple{N,States},
+) where {N}
     @assert length(guess) == N
-    return result_schema!(schema, ntuple(i -> UInt8(guess[i]), Val(N)), states)
+    return result_schema!(schema, ntuple(i -> ASCIIChar(guess[i]), Val(N)), states)
 end
 
 function result_schema!(schema::Schema{N}, guess, states::NTuple{N,States}) where {N}
@@ -184,10 +227,10 @@ function result_schema!(schema::Schema{N}, guess, states::NTuple{N,States}) wher
         char = guess[i]
         if state == Green
             exact[i] = char
-            lowerbound += bitunpack(Base.shl_int(one(UInt32), (char - AA)))
+            lowerbound += bitunpack(Mask(char))
         elseif state == Yellow
-            misses[i] = set(misses[i], char)
-            lowerbound += bitunpack(Base.shl_int(one(UInt32), (char - AA)))
+            misses[i] |= char
+            lowerbound += bitunpack(Mask(char))
         end
     end
 
@@ -197,8 +240,8 @@ function result_schema!(schema::Schema{N}, guess, states::NTuple{N,States}) wher
             char = guess[i]
             # Add this to the "misses" list and clamp the upperbound to the exact number
             # of occurances.
-            misses[i] = set(misses[i], char)
-            upperbound = bitifelse(Base.shl_int(one(UInt32), (char - AA)), lowerbound, upperbound)
+            misses[i] |= char
+            upperbound = bitifelse(Mask(char), lowerbound, upperbound)
         end
     end
     schema.lowerbound = lowerbound
@@ -235,7 +278,7 @@ function Base.iterate(x::PossibleStates, i = 0)
     return state, i + 1
 end
 
-function generate(schema::Schema, guess::NTuple{N,UInt8}) where {N}
+function generate(schema::Schema, guess::NTuple{N,ASCIIChar}) where {N}
     (; upperbound, exact, misses) = schema
     return ntuple(Val(N)) do i
         # If this is an exact match, then the only possibility is green.
@@ -272,25 +315,28 @@ end
 # This mostly used to handle cases where we have exactly one instance of a letter.
 @inline function ispossible(
     schema::Schema,
-    guess::NTuple{N,UInt8},
+    guess::NTuple{N,ASCIIChar},
     result::NTuple{N,States},
 ) where {N}
     # Discard repeat yellows
-    seen = SIMD.Vec{32,UInt8}(0x00)
+    #seen = SIMD.Vec{32,UInt8}(0x00)
+    seen = Mask{UInt32}()
     scratch = SIMD.Vec{32,UInt8}(0x00)
     @inbounds for i in Base.OneTo(N)
         state, char = result[i], guess[i]
         setscratch = false
         if state == Gray
-            seen += bitunpack(Base.shl_int(one(UInt32), (char - AA)))
+            seen |= char
+            #seen += bitunpack(Base.shl_int(one(UInt32), (char - AA)))
         elseif state == Yellow
+            ismatch(seen, char) && return false
             # If this is a Yellow following a Gray, than this should not be possible.
-            iszero(seen[char - AA + 1]) || return false
+            #iszero(seen[char - AA + 1]) || return false
             setscratch = true
         else
             setscratch = true
         end
-        setscratch && (scratch += bitunpack(Base.shl_int(one(UInt32), (char - AA))))
+        setscratch && (scratch += bitunpack(Mask(char)))
     end
     (; lowerbound, upperbound) = schema
     return compare(>=, scratch, lowerbound) && compare(<=, scratch, upperbound)
@@ -298,7 +344,7 @@ end
 
 struct ResultIter{N,I}
     schema::Schema{N}
-    guess::NTuple{N,UInt8}
+    guess::NTuple{N,ASCIIChar}
     iter::I
 end
 
@@ -328,7 +374,7 @@ end
 function countmatches(
     f::F,
     schema::Schema{N},
-    guess::NTuple{N,UInt8},
+    guess::NTuple{N,ASCIIChar},
     dictionary::Union{AbstractVector,DataStructures.OrderedSet};
     tempschema::Schema = Schema{N}(),
     wordcallback::G = (_...) -> nothing,
@@ -395,7 +441,7 @@ function process_dictionary(
 
 
             # Process this batch
-            for i in start:stop
+            for i = start:stop
                 seen .= false
                 maxpartition[] = 0
                 empty!(counts)
@@ -453,7 +499,10 @@ function init_worklist(::Val{N}) where {N}
     return worklist
 end
 
-function process_dictionary_init(dictionary::AbstractVector{<:NTuple{N}}; batchsize = 16) where {N}
+function process_dictionary_init(
+    dictionary::AbstractVector{<:NTuple{N}};
+    batchsize = 16,
+) where {N}
     schema = Schema{N}()
     scores = Vector{Tuple{Int64,Float32}}(undef, length(dictionary))
 
@@ -483,7 +532,7 @@ function process_dictionary_init(dictionary::AbstractVector{<:NTuple{N}}; batchs
             stop = min(k * batchsize, length(dictionary))
 
             # Process this batch
-            for i in start:stop
+            for i = start:stop
                 seen .= false
                 maxpartition[] = 0
                 empty!(counts)

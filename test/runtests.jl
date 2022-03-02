@@ -4,12 +4,14 @@ using Random
 @testset "Testing Utilities" begin
     @testset "Testing `clear!`" begin
         x = rand(UInt32, 100)
+        @test !all(iszero, x)
         Wordle.clear!(x)
         @test all(iszero, x)
 
-        x = rand(Char, 100)
+        x = rand(UInt8, 100)
+        @test !all(iszero, x)
         Wordle.clear!(x)
-        @test all(isequal(' '), x)
+        @test all(iszero, x)
     end
 
     @testset "Testing Bitmask Utilities" begin
