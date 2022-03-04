@@ -69,6 +69,8 @@ Base.zero(::ASCIIChar) = zero(ASCIIChar)
 Base.iszero(char::ASCIIChar) = iszero(char.val)
 Base.:(==)(a::ASCIIChar, b::ASCIIChar) = (a.val == b.val)
 Base.isless(a::ASCIIChar, b::ASCIIChar) = isless(a.val, b.val)
+Base.getindex(simd::SIMD.Vec{N,UInt8}, char::ASCIIChar) where {N} =
+    simd[normalize(char) + 1]
 
 # Masks
 struct Mask{T}
@@ -77,18 +79,30 @@ end
 Mask{T}() where {T} = Mask{T}(zero(T))
 
 Mask(char::ASCIIChar) = Mask{UInt32}(Base.shl_int(one(UInt32), normalize(char)))
+unwrap(mask::Mask) = mask.val
 
 Base.:|(a::Mask{T}, b::Mask{T}) where {T} = Mask{T}(a.val | b.val)
 Base.:|(mask::Mask{UInt32}, char::ASCIIChar) = mask | Mask(char)
 ismatch(a::Mask{T}, b::Mask{T}) where {T} = !iszero(a.val & b.val)
 ismatch(a::Mask{UInt32}, char::ASCIIChar) = ismatch(a, Mask(char))
+flip(a::Mask) = Mask(~unwrap(a))
 
 Base.zero(::Type{Mask{T}}) where {T} = Mask{T}()
-Base.zero(::T) where {T <: Mask} = zero(T)
+Base.zero(::T) where {T<:Mask} = zero(T)
 
 # SIMD Bridges
 bitifelse(mask::Mask, args...) = bitifelse(mask.val, args...)
 bitunpack(mask::Mask) = bitunpack(mask.val)
+
+# Generate counts
+function charcounts(word::NTuple{N,ASCIIChar}) where {N}
+    counts = SIMD.Vec{32,UInt8}(0x00)
+    for i in Base.OneTo(N)
+        char = word[i]
+        counts += bitunpack(Mask(char))
+    end
+    return counts
+end
 
 #####
 ##### Utilities
@@ -181,7 +195,7 @@ end
 
 function merge!(a::Schema{N}, b::Schema{N}) where {N}
     # Merge exact matches and misses
-    for i in Base.OneTo(N)
+    @inbounds for i in Base.OneTo(N)
         b_exact = b.exact[i]
         if !iszero(b_exact)
             a.exact[i] = b_exact
@@ -207,7 +221,8 @@ end
 function result_schema!(
     schema::Schema{N},
     guess::AbstractString,
-    states::NTuple{N,States},
+    states::NTuple{N,States};
+    kw...,
 ) where {N}
     @assert length(guess) == N
     return result_schema!(schema, ntuple(i -> ASCIIChar(guess[i]), Val(N)), states)
@@ -227,6 +242,7 @@ function result_schema!(schema::Schema{N}, guess, states::NTuple{N,States}) wher
         char = guess[i]
         if state == Green
             exact[i] = char
+            misses[i] = flip(Mask(char))
             lowerbound += bitunpack(Mask(char))
         elseif state == Yellow
             misses[i] |= char
@@ -290,7 +306,7 @@ function generate(schema::Schema, guess::NTuple{N,ASCIIChar}) where {N}
         # Check if this character is a known non-existant character.
         # This means that there is a max of 0 entries for this character.
         # If so, it can only be Gray.
-        if iszero(upperbound[char - AA + 1])
+        if iszero(upperbound[char])
             return PossibleStates(Gray)
         end
 
@@ -318,20 +334,19 @@ end
     guess::NTuple{N,ASCIIChar},
     result::NTuple{N,States},
 ) where {N}
-    # Discard repeat yellows
-    #seen = SIMD.Vec{32,UInt8}(0x00)
-    seen = Mask{UInt32}()
+    # Ensure that we can't have a yellow character following a gray coloring of
+    # the same character.
+    seen_gray = Mask{UInt32}()
     scratch = SIMD.Vec{32,UInt8}(0x00)
+
     @inbounds for i in Base.OneTo(N)
         state, char = result[i], guess[i]
         setscratch = false
         if state == Gray
-            seen |= char
-            #seen += bitunpack(Base.shl_int(one(UInt32), (char - AA)))
+            seen_gray |= char
         elseif state == Yellow
-            ismatch(seen, char) && return false
             # If this is a Yellow following a Gray, than this should not be possible.
-            #iszero(seen[char - AA + 1]) || return false
+            ismatch(seen_gray, char) && return false
             setscratch = true
         else
             setscratch = true
@@ -371,33 +386,87 @@ end
 ##### Count possibilies
 #####
 
+const Dictionary = Union{AbstractVector,DataStructures.OrderedSet}
+
+# Bottom Level of Recursion
 function countmatches(
     f::F,
     schema::Schema{N},
     guess::NTuple{N,ASCIIChar},
-    dictionary::Union{AbstractVector,DataStructures.OrderedSet};
-    tempschema::Schema = Schema{N}(),
-    wordcallback::G = (_...) -> nothing,
+    ::Any,
+    target,
+    schema_tuple::Tuple{Schema{N}} = (Schema{N}(),);
     iter = ResultIter(schema, guess),
-) where {F,N,G}
+) where {F,N}
+    tempschema = schema_tuple[1]
+    maxsize = zero(Int64)
+    for states in iter
+        result_schema!(tempschema, guess, states)
+        merge!(tempschema, schema)
+        partitionsize = count(tempschema, target)
+
+        iszero(partitionsize) && continue
+
+        # Otherwise, keep track of the current largest partition size
+        maxsize = max(maxsize, partitionsize)
+
+        # Check for early exit.
+        # If this partition is not as good as the best, then we can abort.
+        f(maxsize) && break
+    end
+    return maxsize
+end
+
+# For intermediate levels, the partition size of a guess is the *minimum* of
+# any sub-partition sizes.
+#
+# So, we need to return the maximum of the minimums of each subpartition.
+function countmatches(
+    f::F,
+    schema::Schema{N},
+    guess::NTuple{N,ASCIIChar},
+    dictionary,
+    target,
+    schema_tuple::NTuple{<:Any,Schema{N}};
+    iter = ResultIter(schema, guess),
+) where {F,N}
+    tempschema = schema_tuple[1]
+    subschema = Base.tail(schema_tuple)
+    maxsize = zero(Int64)
     for states in iter
         result_schema!(tempschema, guess, states)
         merge!(tempschema, schema)
 
-        partitionsize = 0
-        for (i, word) in enumerate(dictionary)
-            if tempschema(word)
-                wordcallback(i)
-                partitionsize += 1
+        # If this level is sufficient to reach a partition size of 1, then no
+        # need to recurse.
+        this_partition = count(tempschema, target)
+
+        # If this partition is impossible, then don't bother recursing.
+        # If this partition doesn't reduce the search space at all, than it's not
+        # a good guess so abort expansion.
+        iszero(this_partition) && continue
+        this_partition == length(target) && return length(target)
+
+        if isone(this_partition)
+            min_subpartition = 1
+        else
+            min_subpartition = typemax(Int64)
+            for next_guess in dictionary
+                partitionsize =
+                    countmatches(f, tempschema, next_guess, dictionary, target, subschema)
+                # This next guess failed, try another
+                iszero(partitionsize) && continue
+                min_subpartition = min(min_subpartition, partitionsize)
             end
+
+            # If this subpartition is impossible, just continue on
+            min_subpartition == typemax(Int64) && continue
         end
 
-        if !iszero(partitionsize)
-            proceed = f(partitionsize)
-            proceed || return nothing
-        end
+        maxsize = max(maxsize, min_subpartition)
+        f(maxsize) && break
     end
-    return nothing
+    return maxsize
 end
 
 #####
@@ -417,19 +486,17 @@ function process_dictionary(
 
     threads = Base.OneTo(Threads.nthreads())
     counts_tls = [Vector{Int}() for _ in threads]
-    tempschema_tls = [Schema{N}() for _ in threads]
-    seen_tls = [falses(length(target)) for _ in threads]
+    tempschema_tls = [(Schema{N}(),Schema{N}()) for _ in threads]
 
     meter = ProgressMeter.Progress(length(dictionary), 1)
     best_bound = Threads.Atomic{Int}(typemax(Int))
+    abort = Abort(best_bound)
     workcount = Threads.Atomic{Int}(1)
     numbatches = cdiv(length(dictionary), batchsize)
 
-    #for tid in Base.OneTo(Threads.nthreads())
     Threads.@threads for tid in Base.OneTo(Threads.nthreads())
         maxpartition = Ref(0)
         tempschema = tempschema_tls[tid]
-        seen = seen_tls[tid]
         counts = counts_tls[tid]
         while true
             # Get this threads work load
@@ -439,36 +506,20 @@ function process_dictionary(
             start = (k - 1) * batchsize + 1
             stop = min(k * batchsize, length(dictionary))
 
-
             # Process this batch
             for i = start:stop
-                seen .= false
                 maxpartition[] = 0
                 empty!(counts)
-                wordcallback(i) = (seen[i] = true)
 
-                countmatches(
-                    schema,
-                    dictionary[i],
-                    target;
-                    tempschema,
-                    wordcallback,
-                ) do partitionsize
-                    push!(counts, partitionsize)
-                    maxpartition[] = max(maxpartition[], partitionsize)
-                    # Only continue if this partition is within the best bound.
-                    return partitionsize <= best_bound[]
+                guess = dictionary[i]
+                maxsize = countmatches(abort, schema, guess, dictionary, target, tempschema)
+
+                # Handle edge-case zeros by clamping to the worst case.
+                maxsize = iszero(maxsize) ? length(dictionary) : maxsize
+                if maxsize <= best_bound[]
+                    Threads.atomic_min!(best_bound, maxsize)
                 end
-
-                # Handle any words that aren't covered by entering this guess
-                missed = length(target) - count(seen)
-                iszero(missed) || push!(counts, missed)
-                maxpartition_unbox = max(maxpartition[], missed)
-                if maxpartition_unbox < best_bound[]
-                    Threads.atomic_min!(best_bound, maxpartition_unbox)
-                end
-
-                scores[i] = (maxpartition_unbox, mean(counts))
+                scores[i] = (maxsize, zero(Float32))
             end
             tid == 1 && ProgressMeter.update!(meter, stop)
         end
@@ -477,51 +528,37 @@ function process_dictionary(
     return scores
 end
 
-# Initial filtering
+_kickstart_bounds(::Val{N}, dictionary) where {N} = length(dictionary)
+_kickstart_bounds(::Val{5}, _) = 55
 
-function worklist_lt(a::NTuple{N}, b::NTuple{N}) where {N}
-    gray_a = count(isequal(Gray), a)
-    gray_b = count(isequal(Gray), b)
-    yellow_a = count(isequal(Yellow), a)
-    yellow_b = count(isequal(Yellow), b)
-    if gray_a > gray_b
-        return true
-    elseif gray_a == gray_b && yellow_a > yellow_b
-        return true
-    end
-    return false
+struct Abort{T}
+    best::Threads.Atomic{T}
 end
 
-function init_worklist(::Val{N}) where {N}
-    states = (Gray, Yellow, Green)
-    worklist = vec(collect(Iterators.product(ntuple(_ -> states, Val(N))...)))
-    sort!(worklist; lt = worklist_lt)
-    return worklist
-end
+(f::Abort)(x) = (x > f.best[])
 
 function process_dictionary_init(
     dictionary::AbstractVector{<:NTuple{N}};
-    batchsize = 16,
+    batchsize = 8,
+    kickstart_bound = _kickstart_bounds(Val(N), dictionary),
 ) where {N}
+    @show kickstart_bound
     schema = Schema{N}()
     scores = Vector{Tuple{Int64,Float32}}(undef, length(dictionary))
 
     threads = Base.OneTo(Threads.nthreads())
-    tempschema_tls = [Schema{N}() for _ in threads]
+    tempschema_tls = [(Schema{N}(),Schema{N}()) for _ in threads]
     counts_tls = [Vector{Int}() for _ in threads]
-    seen_tls = [falses(length(dictionary)) for _ in threads]
 
     meter = ProgressMeter.Progress(length(dictionary), 1)
-    best_bound = Threads.Atomic{Int}(typemax(Int))
+    best_bound = Threads.Atomic{Int}(kickstart_bound)
+    abort = Abort(best_bound)
     workcount = Threads.Atomic{Int}(1)
     numbatches = cdiv(length(dictionary), batchsize)
-    worklist = init_worklist(Val(N))
 
-    #for tid in Base.OneTo(Threads.nthreads())
     Threads.@threads for tid in Base.OneTo(Threads.nthreads())
         maxpartition = Ref(0)
         tempschema = tempschema_tls[tid]
-        seen = seen_tls[tid]
         counts = counts_tls[tid]
         while true
             # Get this threads work load
@@ -533,37 +570,23 @@ function process_dictionary_init(
 
             # Process this batch
             for i = start:stop
-                seen .= false
                 maxpartition[] = 0
                 empty!(counts)
 
-                wordcallback(i) = (seen[i] = true)
                 guess = dictionary[i]
-                countmatches(
-                    schema,
-                    guess,
-                    dictionary;
-                    tempschema,
-                    wordcallback,
-                    iter = Iterators.filter(x -> ispossible(schema, guess, x), worklist),
-                ) do partitionsize
-                    push!(counts, partitionsize)
-                    maxpartition[] = max(maxpartition[], partitionsize)
-                    # Only continue if we're stiller better than the best bound so far.
-                    return maxpartition[] <= best_bound[]
+                maxsize =
+                    countmatches(abort, schema, guess, dictionary, dictionary, tempschema)
+
+                # Handle edge-case zeros by clamping to the worst case.
+                maxsize = iszero(maxsize) ? length(dictionary) : maxsize
+                if maxsize <= best_bound[]
+                    Threads.atomic_min!(best_bound, maxsize)
                 end
 
-                # Handle any words that aren't covered by entering this guess
-                missed = length(dictionary) - count(seen)
-                iszero(missed) || push!(counts, missed)
-                maxpartition_unbox = max(maxpartition[], missed)
-                if maxpartition_unbox <= best_bound[]
-                    Threads.atomic_min!(best_bound, maxpartition_unbox)
-                end
-
-                scores[i] = (maxpartition_unbox, mean(counts))
+                scores[i] = (maxsize, zero(Float32))
             end
-            tid == 1 && ProgressMeter.update!(meter, stop)
+
+            @show workcount[], numbatches, best_bound[]
         end
     end
     ProgressMeter.finish!(meter)
