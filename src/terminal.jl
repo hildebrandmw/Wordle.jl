@@ -30,7 +30,7 @@ function newgame(
             # This is SOO gross ...
             _scores = process_dictionary(schema, dictionary, schemas; target)
 
-            function by((score1, word1), (score2, word2))
+            function lt((score1, word1), (score2, word2))
                 if score1 < score2
                     return true
                 elseif score1 == score2
@@ -40,7 +40,7 @@ function newgame(
                 end
                 return false
             end
-            temp = sort(Glue(_scores, dictionary); by = by)
+            temp = sort(Glue(_scores, dictionary); lt = lt)
             scores = first.(temp)
             dictionary_sorted = last.(temp)
 
