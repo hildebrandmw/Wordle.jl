@@ -19,6 +19,7 @@ import ProgressMeter
 import SIMD
 import StaticArrays: MVector
 include("simd.jl")
+include("utils.jl")
 
 #####
 ##### Dictionary Loading
@@ -56,6 +57,7 @@ end
 Base.Char(char::ASCIIChar) = Char(char.val)
 Base.show(io::IO, char::ASCIIChar) = show(io, Char(char))
 Base.print(io::IO, char::ASCIIChar) = print(io, Char(char))
+Base.convert(::Type{UInt8}, char::ASCIIChar) = char.val
 
 ASCIIChar(char::Char) = ASCIIChar(convert(UInt8, char))
 
@@ -105,368 +107,263 @@ function charcounts(word::NTuple{N,ASCIIChar}) where {N}
 end
 
 #####
-##### Utilities
+##### Preencode Wordes
 #####
 
-# Set our vectors to their default state
-function clear!(x::AbstractVector{T}) where {T}
-    @inbounds for i in eachindex(x)
-        x[i] = zero(T)
+@inline choose_simd_width(N) = N > 8 ? 16 : 8
+
+struct Fingerprint{N,M}
+    masks::SIMD.Vec{M,UInt32}
+    counts::SIMD.Vec{32,UInt8}
+end
+
+function Fingerprint(word::NTuple{N,ASCIIChar}) where {N}
+    M = choose_simd_width(N)
+    masks_tuple = ntuple(Val(M)) do i
+        i > N && return zero(UInt32)
+        return unwrap(Mask(word[i]))
     end
-    return x
+
+    return Fingerprint{N,M}(SIMD.Vec{M,UInt32}(masks_tuple), charcounts(word))
 end
 
-@inline function unsafe_match(
-    v::AbstractVector{ASCIIChar},
-    (char, index)::Tuple{ASCIIChar,<:Integer},
-)
-    val = @inbounds(v[index])
-    return iszero(val) || val == char
-end
-
-@inline function unsafe_strict_match(
-    v::AbstractVector{ASCIIChar},
-    (char, index)::Tuple{ASCIIChar,<:Integer},
-)
-    return @inbounds(v[index]) == char
-end
-
-@inline function unsafe_match(
-    v::AbstractVector{Mask{UInt32}},
-    (mask, index)::Tuple{Mask{UInt32},<:Integer},
-)
-    return ismatch(@inbounds(v[index]), mask)
-end
-
-@inline function unsafe_match(
-    v::AbstractVector{Mask{UInt32}},
-    (char, index)::Tuple{ASCIIChar,<:Integer},
-)
-    return unsafe_match(v, (Mask(char), index))
+function getword(f::Fingerprint{N}) where {N}
+    # Reverse the finterprint mask
+    word = ntuple(Val(N)) do i
+        mask = f.masks[i]
+        j = Base.trailing_zeros(mask)
+        return ASCIIChar(UInt('a') + j)
+    end
+    return join(word)
 end
 
 #####
 ##### Discovered Knowledge
 #####
 
-mutable struct Schema{N}
-    exact::MVector{N,ASCIIChar}
-    misses::MVector{N,Mask{UInt32}}
+abstract type AbstractSchema{N} end
+struct EmptySchema{N} <: AbstractSchema{N} end
+struct Schema{N,M} <: AbstractSchema{N}
+    misses::SIMD.Vec{M,UInt32}
     lowerbound::SIMD.Vec{32,UInt8}
     upperbound::SIMD.Vec{32,UInt8}
 end
 
-function Schema{N}() where {N}
-    exact = MVector{N,ASCIIChar}(undef)
-    misses = MVector{N,Mask{UInt32}}(undef)
-    lowerbound = SIMD.Vec{32,UInt8}(0x00)
-    upperbound = SIMD.Vec{32,UInt8}(0xff)
-    schema = Schema{N}(exact, misses, lowerbound, upperbound)
-    empty!(schema)
-    return schema
+Schema{N,M}() where {N,M} = Schema{N,M}(schema_template(Val(N))...)
+function Schema{N}(misses::SIMD.Vec{M,UInt32}, lowerbound, upperbound) where {N,M}
+    return Schema{N,M}(misses, lowerbound, upperbound)
 end
 
-function Base.empty!(schema::Schema)
-    clear!(schema.exact)
-    clear!(schema.misses)
-    return schema
+function schema_template(::Val{N}) where {N}
+    M = choose_simd_width(N)
+    misses = SIMD.Vec{M,UInt32}(0x00)
+    lowerbound = SIMD.Vec{32,UInt8}(0x00)
+    upperbound = SIMD.Vec{32,UInt8}(0xff)
+    return (; misses, lowerbound, upperbound)
 end
 
 # Filtering
-compare(f::F, x::SIMD.Vec{32,UInt8}, y::SIMD.Vec{32,UInt8}) where {F} = sum(f(x, y)) == 32
-function (f::Schema)(s::Union{AbstractString,Tuple})
-    (; exact, misses, lowerbound, upperbound) = f
-    scratch = SIMD.Vec{32,UInt8}(0x00)
+compare(f::F, x::SIMD.Vec{N,T}, y::SIMD.Vec{N,T}) where {F,N,T} = sum(f(x, y)) == N
+allof(x::SIMD.Vec{N,Bool}) where {N} = iszero(sum(!x))
+anyof(x::SIMD.Vec{N,Bool}) where {N} = !iszero(sum(x))
 
-    # Bit mask for characters processed for bounds checking.
-    for (index, char) in enumerate(s)
-        # If this isn't match a known hit - return false.
-        # If we know this character does not belong at this index, also return false
-        if !unsafe_match(exact, (char, index)) || unsafe_match(misses, (char, index))
-            return false
-        end
+function (f::Schema{N,M})(x::Fingerprint{N,M}) where {N,M}
+    (; misses, lowerbound, upperbound) = f
+    (; masks, counts) = x
 
-        # Increment the character count
-        scratch += bitunpack(Mask(char))
+    green_match = allof(iszero(misses & masks))
+    lowerbound_match = compare(>=, counts, lowerbound)
+    upperbound_match = compare(<=, counts, upperbound)
+    return green_match & lowerbound_match & upperbound_match
+end
+
+merge(::EmptySchema{N}, b::Schema{N}) where {N} = b
+function merge(a::Schema{N}, b::Schema{N}) where {N}
+    return Schema{N}(
+        a.misses | b.misses,
+        max(a.lowerbound, b.lowerbound),
+        min(a.upperbound, b.upperbound),
+    )
+end
+
+iscompatible(::EmptySchema{N}, b::Schema{N}) where {N} = true
+function iscompatible(a::T, b::T) where {T<:Schema}
+    # "b" is not compatible with "a" if
+    # (1) "b" has an exact match (inverted mask) that contradicts a known non-match in "a"
+    # (2) "b" has a non-match that contradicts a known match (inverted mask) in "a"
+    #
+    # We can check this by "or"-ing together the two mask vectors and checking if any
+    # result in all-ones masks.
+    #
+    # If there is a mismatch, than "green_mismatch" will be true.
+    green_mismatch = anyof((a.misses | b.misses) == typemax(UInt32))
+
+    # Next, we have to check whether "b" has incompatible bounds compared to "a". This is
+    # the case if
+    # (1) "b.upperbound" is less than "a.lowerbound"
+    # (2) "b.lowerbound" is greater than "b.upperbond"
+    lowerbound_mismatch = anyof(b.upperbound < a.lowerbound)
+    upperbound_mismatch = anyof(b.lowerbound > a.upperbound)
+    return !(green_mismatch | lowerbound_mismatch | upperbound_mismatch)
+end
+
+const Gray = UInt8(1)
+const Yellow = UInt8(2)
+const Green = UInt8(3)
+
+isgray(x::Union{UInt8,SIMD.Vec{<:Any,UInt8}}) = (x == Gray)
+isyellow(x::Union{UInt8,SIMD.Vec{<:Any,UInt8}}) = (x == Yellow)
+isgreen(x::Union{UInt8,SIMD.Vec{<:Any,UInt8}}) = (x == Green)
+
+function tovec(states::NTuple{N,UInt8}) where {N}
+    M = choose_simd_width(N)
+    states_tuple = ntuple(Val(M)) do i
+        i > N && return zero(UInt8)
+        return UInt8(states[i])
     end
-    # Perform bounds checks
-    return compare(>=, scratch, lowerbound) & compare(<=, scratch, upperbound)
+    return SIMD.Vec{M,UInt8}(states_tuple)
 end
 
-function merge!(a::Schema{N}, b::Schema{N}) where {N}
-    # Merge exact matches and misses
-    @inbounds for i in Base.OneTo(N)
-        b_exact = b.exact[i]
-        if !iszero(b_exact)
-            a.exact[i] = b_exact
-        end
-        a.misses[i] |= b.misses[i]
-    end
+convert_guess(x::Fingerprint) = x
+convert_guess(x::NTuple{N,ASCIIChar}) where {N} = convert_guess(Fingerprint(x))
 
-    # Merge upper and lower bounds
-    a.lowerbound = max(a.lowerbound, b.lowerbound)
-    a.upperbound = min(a.upperbound, b.upperbound)
-    return a
+convert_states(x::SIMD.Vec{N,UInt8}) where {N} = x
+convert_states(x::NTuple{N,UInt8}) where {N} = convert_states(tovec(x))
+
+function result_schema(guess, states)
+    return _result_schema(convert_guess(guess), convert_states(states))
 end
 
-#####
-##### Result Logic
-#####
-
-@enum States::UInt8 Gray = 1 Yellow = 2 Green = 4
-function result_schema(guess, states::NTuple{N,States}) where {N}
-    return result_schema!(Schema{N}(), guess, states)
-end
-
-function result_schema!(
-    schema::Schema{N},
-    guess::AbstractString,
-    states::NTuple{N,States};
-    kw...,
-) where {N}
-    @assert length(guess) == N
-    return result_schema!(schema, ntuple(i -> ASCIIChar(guess[i]), Val(N)), states)
-end
-
-function result_schema!(schema::Schema{N}, guess, states::NTuple{N,States}) where {N}
-    empty!(schema)
-    (; exact, misses) = schema
+function _result_schema(guess::Fingerprint{N,M}, states::SIMD.Vec{M,UInt8}) where {N,M}
+    (; masks) = guess
+    #(; misses, lowerbound, upperbound) = schema_template(Val(N))
+    misses = SIMD.vifelse(isgreen(states), ~masks, masks)
     lowerbound = SIMD.Vec{32,UInt8}(0x00)
-    upperbound = SIMD.Vec{32,UInt8}(0xff)
-
-    # Process correct guesses first, then process incorrect guesses.
-    # This makes it easier to deal with incorrect guesses that repeat a letter that
-    # was correct.
+    graymask = zero(UInt32)
     @inbounds for i in Base.OneTo(N)
-        state = states[i]
-        char = guess[i]
-        if state == Green
-            exact[i] = char
-            misses[i] = flip(Mask(char))
-            lowerbound += bitunpack(Mask(char))
-        elseif state == Yellow
-            misses[i] |= char
-            lowerbound += bitunpack(Mask(char))
-        end
-    end
-
-    @inbounds for i in Base.OneTo(N)
-        state = states[i]
-        if state == Gray
-            char = guess[i]
-            # Add this to the "misses" list and clamp the upperbound to the exact number
-            # of occurances.
-            misses[i] |= char
-            upperbound = bitifelse(Mask(char), lowerbound, upperbound)
-        end
-    end
-    schema.lowerbound = lowerbound
-    schema.upperbound = upperbound
-    return schema
-end
-
-#####
-##### Result Generator
-#####
-
-struct PossibleStates
-    val::UInt8
-end
-
-function PossibleStates(states::States...)
-    val = zero(UInt8)
-    for state in states
-        val |= UInt8(state)
-    end
-    return PossibleStates(val)
-end
-
-Base.show(io::IO, x::PossibleStates) = print(io, Tuple(collect(x)))
-Base.length(x::PossibleStates) = count_ones(x.val)
-Base.eltype(::Type{PossibleStates}) = States
-function Base.iterate(x::PossibleStates, i = 0)
-    (; val) = x
-    while iszero(val & (Base.shl_int(1, i)))
-        i += 1
-        (i > 2) && return nothing
-    end
-    state = (i == 0) ? Gray : (i == 1 ? Yellow : Green)
-    return state, i + 1
-end
-
-function generate(schema::Schema, guess::NTuple{N,ASCIIChar}) where {N}
-    (; upperbound, exact, misses) = schema
-    return ntuple(Val(N)) do i
-        # If this is an exact match, then the only possibility is green.
-        char = @inbounds(guess[i])
-        if unsafe_strict_match(exact, (char, i))
-            return PossibleStates(Green)
-        end
-
-        # Check if this character is a known non-existant character.
-        # This means that there is a max of 0 entries for this character.
-        # If so, it can only be Gray.
-        if iszero(upperbound[char])
-            return PossibleStates(Gray)
-        end
-
-        # Now check if this is forced to be either Gray or Yellow
-        # Basically, if we know there is another exact match for this position, than this
-        # index cannot be green.
-        #
-        # This can also be forced to be either Gray or Yellow if we know this character
-        # does not belong in this possition.
-        if !iszero(exact[i]) || unsafe_match(misses, (char, i))
-            return PossibleStates(Yellow, Gray)
-        end
-
-        # Default case, entry can be anything.
-        return PossibleStates(Green, Yellow, Gray)
-    end
-end
-
-# Use this to filter out results generated by `generate_possibilities` that still validate
-# the schema.
-#
-# This mostly used to handle cases where we have exactly one instance of a letter.
-@inline function ispossible(
-    schema::Schema,
-    guess::NTuple{N,ASCIIChar},
-    result::NTuple{N,States},
-) where {N}
-    # Ensure that we can't have a yellow character following a gray coloring of
-    # the same character.
-    seen_gray = Mask{UInt32}()
-    scratch = SIMD.Vec{32,UInt8}(0x00)
-
-    @inbounds for i in Base.OneTo(N)
-        state, char = result[i], guess[i]
-        setscratch = false
-        if state == Gray
-            seen_gray |= char
-        elseif state == Yellow
-            # If this is a Yellow following a Gray, than this should not be possible.
-            ismatch(seen_gray, char) && return false
-            setscratch = true
+        mask = masks[i]
+        if isgray(states[i])
+            graymask |= mask
         else
-            setscratch = true
+            lowerbound = bitifelse(mask, lowerbound + one(lowerbound), lowerbound)
         end
-        setscratch && (scratch += bitunpack(Mask(char)))
     end
-    (; lowerbound, upperbound) = schema
-    return compare(>=, scratch, lowerbound) && compare(<=, scratch, upperbound)
+    upperbound = bitifelse(graymask, lowerbound, SIMD.Vec{32,UInt8}(0xff))
+    return Schema{N}(misses, lowerbound, upperbound)
 end
 
-struct ResultIter{N,I}
-    schema::Schema{N}
-    guess::NTuple{N,ASCIIChar}
-    iter::I
-end
+function generate_schemas(dictionary::AbstractVector{NTuple{N,ASCIIChar}}) where {N}
+    # Parameters
+    M = choose_simd_width(N)
 
-function ResultIter(schema::Schema{N}, guess::NTuple{N}) where {N}
-    iter = Iterators.product(generate(schema, guess)...)
-    return ResultIter(schema, guess, iter)
-end
-Base.IteratorSize(::Type{<:ResultIter}) = Base.SizeUnknown()
-
-function Base.iterate(ri::ResultIter, s...)
-    (; schema, guess, iter) = ri
-    y = iterate(iter, s...)
-    y === nothing && return nothing
-    (v, s) = y
-    while !ispossible(schema, guess, v)
-        y = iterate(iter, s)
-        y === nothing && return nothing
-        (v, s) = y
+    # Setup iteration space and Schema results
+    possible_states = (Gray, Yellow, Green)
+    iterator = ntuple(Returns(possible_states), Val(N))
+    schemas = Matrix{Schema{N,M}}(undef, length(possible_states)^N, length(dictionary))
+    for (j, word) in enumerate(dictionary)
+        for (i, states) in enumerate(Iterators.product(iterator...))
+            schemas[i, j] = result_schema(word, states)
+        end
     end
-    return v, s
+    return schemas
 end
 
 #####
 ##### Count possibilies
 #####
 
-const Dictionary = Union{AbstractVector,DataStructures.OrderedSet}
+struct CountMatches{N} end
 
-# Bottom Level of Recursion
-function countmatches(
-    f::F,
-    schema::Schema{N},
-    guess::NTuple{N,ASCIIChar},
-    ::Any,
-    target,
-    schema_tuple::Tuple{Schema{N}} = (Schema{N}(),);
-    iter = ResultIter(schema, guess),
-) where {F,N}
-    tempschema = schema_tuple[1]
-    maxsize = zero(Int64)
-    for states in iter
-        result_schema!(tempschema, guess, states)
-        merge!(tempschema, schema)
-        partitionsize = count(tempschema, target)
-
-        iszero(partitionsize) && continue
-
-        # Otherwise, keep track of the current largest partition size
-        maxsize = max(maxsize, partitionsize)
-
-        # Check for early exit.
-        # If this partition is not as good as the best, then we can abort.
-        f(maxsize) && break
+function reverse_state(::Val{N}, i) where {N}
+    possible_states = (Gray, Yellow, Green)
+    iterator = ntuple(Returns(possible_states), Val(N))
+    count = 0
+    for states in Iterators.product(iterator...)
+        count += 1
+        count == i && return states
     end
-    return maxsize
+    return nothing
 end
 
-# For intermediate levels, the partition size of a guess is the *minimum* of
-# any sub-partition sizes.
-#
-# So, we need to return the maximum of the minimums of each subpartition.
-function countmatches(
+# Bottom of recursion
+const Dictionary{T} = Union{AbstractVector{T},DataStructures.OrderedSet{T}}
+function (::CountMatches{1})(
     f::F,
-    schema::Schema{N},
-    guess::NTuple{N,ASCIIChar},
-    dictionary,
-    target,
-    schema_tuple::NTuple{<:Any,Schema{N}};
-    iter = ResultIter(schema, guess),
-) where {F,N}
-    tempschema = schema_tuple[1]
-    subschema = Base.tail(schema_tuple)
+    schema::AbstractSchema{N},
+    guess,
+    schemas::AbstractMatrix,
+    target::Dictionary{Fingerprint{N,M}},
+) where {F,N,M}
     maxsize = zero(Int64)
-    for states in iter
-        result_schema!(tempschema, guess, states)
-        merge!(tempschema, schema)
+    for (i, nextschema) in enumerate(view(schemas, :, guess))
+        iscompatible(schema, nextschema) || continue
+        mergedschema = merge(schema, nextschema)
+        partitionsize = count(mergedschema, target)
 
-        # If this level is sufficient to reach a partition size of 1, then no
-        # need to recurse.
-        this_partition = count(tempschema, target)
+        # If adding this guess results in no remaining words, it's invalid
+        # and we should just continue
+        iszero(partitionsize) && continue
+        maxsize = max(maxsize, partitionsize)
 
-        # If this partition is impossible, then don't bother recursing.
-        # If this partition doesn't reduce the search space at all, than it's not
-        # a good guess so abort expansion.
+        # Check for early exit
+        f(maxsize) && break
+    end
+    return maxsize, 1
+end
+
+function (::CountMatches{K})(
+    f::F,
+    schema::AbstractSchema{N},
+    guess,
+    schemas::AbstractMatrix,
+    target::Dictionary{Fingerprint{N,M}};
+    targetbuffer = Vector{Fingerprint{N,M}}(),
+) where {K,F,N,M}
+    maxsize = zero(Int64)
+    maxheight = zero(Int64)
+    for nextschema in view(schemas, :, guess)
+        iscompatible(schema, nextschema) || continue
+
+        mergedschema = merge(schema, nextschema)
+        empty!(targetbuffer)
+        for fingerprint in Iterators.filter(mergedschema, target)
+            push!(targetbuffer, fingerprint)
+        end
+        this_partition = length(targetbuffer)
+
         iszero(this_partition) && continue
-        this_partition == length(target) && return length(target)
-
         if isone(this_partition)
             min_subpartition = 1
+            this_treeheight = 1
         else
             min_subpartition = typemax(Int64)
-            for next_guess in dictionary
-                partitionsize =
-                    countmatches(f, tempschema, next_guess, dictionary, target, subschema)
-                # This next guess failed, try another
+            this_treeheight = typemax(Int64)
+            for next_guess in Base.OneTo(size(schemas, 2))
+                partitionsize, height = (CountMatches{K - 1}())(
+                    f,
+                    mergedschema,
+                    next_guess,
+                    schemas,
+                    targetbuffer,
+                )
                 iszero(partitionsize) && continue
-                min_subpartition = min(min_subpartition, partitionsize)
+
+                if partitionsize < min_subpartition
+                    min_subpartition = partitionsize
+                    # Increment the height to indicate that this partition came
+                    # from deeper in the search tree.
+                    this_treeheight = height + 1
+                end
             end
 
-            # If this subpartition is impossible, just continue on
             min_subpartition == typemax(Int64) && continue
         end
 
         maxsize = max(maxsize, min_subpartition)
+        maxheight = max(maxheight, this_treeheight)
         f(maxsize) && break
     end
-    return maxsize
+    return maxsize, maxheight
 end
 
 #####
@@ -476,60 +373,9 @@ end
 cdiv(a::Integer, b::Integer) = cdiv(promote(a, b)...)
 cdiv(a::T, b::T) where {T<:Integer} = one(T) + div(a - one(T), b)
 
-function process_dictionary(
-    schema::Schema{N},
-    dictionary;
-    target = DataStructures.OrderedSet(dictionary),
-    batchsize = 16,
-) where {N}
-    scores = Vector{Tuple{Int64,Float32}}(undef, length(dictionary))
-
-    threads = Base.OneTo(Threads.nthreads())
-    counts_tls = [Vector{Int}() for _ in threads]
-    tempschema_tls = [(Schema{N}(),Schema{N}()) for _ in threads]
-
-    meter = ProgressMeter.Progress(length(dictionary), 1)
-    best_bound = Threads.Atomic{Int}(typemax(Int))
-    abort = Abort(best_bound)
-    workcount = Threads.Atomic{Int}(1)
-    numbatches = cdiv(length(dictionary), batchsize)
-
-    Threads.@threads for tid in Base.OneTo(Threads.nthreads())
-        maxpartition = Ref(0)
-        tempschema = tempschema_tls[tid]
-        counts = counts_tls[tid]
-        while true
-            # Get this threads work load
-            k = Threads.atomic_add!(workcount, 1)
-            k > numbatches && break
-
-            start = (k - 1) * batchsize + 1
-            stop = min(k * batchsize, length(dictionary))
-
-            # Process this batch
-            for i = start:stop
-                maxpartition[] = 0
-                empty!(counts)
-
-                guess = dictionary[i]
-                maxsize = countmatches(abort, schema, guess, dictionary, target, tempschema)
-
-                # Handle edge-case zeros by clamping to the worst case.
-                maxsize = iszero(maxsize) ? length(dictionary) : maxsize
-                if maxsize <= best_bound[]
-                    Threads.atomic_min!(best_bound, maxsize)
-                end
-                scores[i] = (maxsize, zero(Float32))
-            end
-            tid == 1 && ProgressMeter.update!(meter, stop)
-        end
-    end
-    ProgressMeter.finish!(meter)
-    return scores
-end
-
 _kickstart_bounds(::Val{N}, dictionary) where {N} = length(dictionary)
-_kickstart_bounds(::Val{5}, _) = 55
+_kickstart_bounds(::Val{5}, _) = 46
+_kickstart_bounds(::Val{6}, _) = 29
 
 struct Abort{T}
     best::Threads.Atomic{T}
@@ -537,29 +383,26 @@ end
 
 (f::Abort)(x) = (x > f.best[])
 
-function process_dictionary_init(
-    dictionary::AbstractVector{<:NTuple{N}};
+function process_dictionary(
+    schema::AbstractSchema{N},
+    dictionary::AbstractVector{Fingerprint{N,M}},
+    schemas::AbstractMatrix{Schema{N,M}};
     batchsize = 8,
-    kickstart_bound = _kickstart_bounds(Val(N), dictionary),
-) where {N}
-    @show kickstart_bound
-    schema = Schema{N}()
-    scores = Vector{Tuple{Int64,Float32}}(undef, length(dictionary))
-
-    threads = Base.OneTo(Threads.nthreads())
-    tempschema_tls = [(Schema{N}(),Schema{N}()) for _ in threads]
-    counts_tls = [Vector{Int}() for _ in threads]
+    target = dictionary,
+) where {N,M}
+    scores = Vector{Tuple{Int64,Int64}}(undef, length(dictionary))
 
     meter = ProgressMeter.Progress(length(dictionary), 1)
-    best_bound = Threads.Atomic{Int}(kickstart_bound)
+    best_bound = Threads.Atomic{Int}(_kickstart_bounds(Val(N), target))
+    #best_bound = Threads.Atomic{Int}(46)
     abort = Abort(best_bound)
     workcount = Threads.Atomic{Int}(1)
     numbatches = cdiv(length(dictionary), batchsize)
 
+    buffers = [Vector{Fingerprint{N,M}}() for _ in Base.OneTo(Threads.nthreads())]
+
     Threads.@threads for tid in Base.OneTo(Threads.nthreads())
         maxpartition = Ref(0)
-        tempschema = tempschema_tls[tid]
-        counts = counts_tls[tid]
         while true
             # Get this threads work load
             k = Threads.atomic_add!(workcount, 1)
@@ -571,11 +414,14 @@ function process_dictionary_init(
             # Process this batch
             for i = start:stop
                 maxpartition[] = 0
-                empty!(counts)
-
-                guess = dictionary[i]
-                maxsize =
-                    countmatches(abort, schema, guess, dictionary, dictionary, tempschema)
+                maxsize, maxheight = (CountMatches{2}())(
+                    abort,
+                    schema,
+                    i,
+                    schemas,
+                    target;
+                    targetbuffer = buffers[tid],
+                )
 
                 # Handle edge-case zeros by clamping to the worst case.
                 maxsize = iszero(maxsize) ? length(dictionary) : maxsize
@@ -583,10 +429,11 @@ function process_dictionary_init(
                     Threads.atomic_min!(best_bound, maxsize)
                 end
 
-                scores[i] = (maxsize, zero(Float32))
+                scores[i] = (maxsize, maxheight)
             end
 
-            @show workcount[], numbatches, best_bound[]
+            batch = workcount[] - Threads.nthreads()
+            @show batch, numbatches, best_bound[]
         end
     end
     ProgressMeter.finish!(meter)
@@ -601,6 +448,7 @@ struct Glue{A,B} <: AbstractVector{Tuple{A,B}}
     a::Vector{A}
     b::Vector{B}
 end
+
 Base.size(g::Glue) = size(g.a)
 Base.getindex(g::Glue, i::Int) = (g.a[i], g.b[i])
 function Base.setindex!(g::Glue, (a, b), i::Int)
