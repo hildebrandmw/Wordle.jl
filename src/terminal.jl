@@ -7,6 +7,7 @@ function newgame(wordlength::Integer, file; hardmode = false, original_guess = n
         @assert length(original_guess) == wordlength
         original_guess = Fingerprint(Tuple(ASCIIChar.(collect(original_guess))))
     end
+    Random.shuffle!(d)
     return newgame(d; hardmode, original_guess)
 end
 
