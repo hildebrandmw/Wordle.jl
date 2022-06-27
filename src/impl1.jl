@@ -3,7 +3,6 @@
 #####
 
 @inline choose_simd_width(N) = N > 8 ? 16 : 8
-
 struct Fingerprint{N,M}
     masks::SIMD.Vec{M,UInt32}
     counts::SIMD.Vec{32,UInt8}
@@ -143,6 +142,21 @@ function _result_schema(guess::Fingerprint{N,M}, states::SIMD.Vec{M,UInt8}) wher
     return Schema{N}(misses, lowerbound, upperbound)
 end
 
+function state_sort(a::NTuple{N,UInt8}, b::NTuple{N,UInt8}) where {N}
+    # Prioritize number of zeros, than number of ones.
+    zeros_a = count(iszero, a)
+    zeros_b = count(iszero, b)
+    ones_a = count(isone, a)
+    ones_b = count(isone, b)
+
+    if zeros_a > zeros_b
+        return true
+    elseif (zeros_a + ones_a) > (zeros_b + ones_b)
+        return true
+    end
+    return false
+end
+
 function generate_schemas(dictionary::AbstractVector{NTuple{N,ASCIIChar}}) where {N}
     # Parameters
     M = choose_simd_width(N)
@@ -150,12 +164,16 @@ function generate_schemas(dictionary::AbstractVector{NTuple{N,ASCIIChar}}) where
     # Setup iteration space and Schema results
     possible_states = (Gray, Yellow, Green)
     iterator = ntuple(Returns(possible_states), Val(N))
+    allstates = vec(collect(Iterators.product(iterator...)))
+    sort!(allstates; lt = state_sort)
+
     schemas = Matrix{Schema{N,M}}(undef, length(possible_states)^N, length(dictionary))
     for (j, word) in enumerate(dictionary)
-        for (i, states) in enumerate(Iterators.product(iterator...))
+        for (i, states) in enumerate(allstates)
             schemas[i, j] = result_schema(word, states)
         end
     end
+    println("Done!")
     return schemas
 end
 
@@ -277,7 +295,7 @@ cdiv(a::T, b::T) where {T<:Integer} = one(T) + div(a - one(T), b)
 
 _kickstart_bounds(::Val{N}, dictionary) where {N} = length(dictionary)
 _kickstart_bounds(::Val{4}, _) = 101
-_kickstart_bounds(::Val{5}, _) = 46
+#_kickstart_bounds(::Val{5}, _) = 46
 #_kickstart_bounds(::Val{6}, _) = 29
 
 struct Abort{T}
@@ -290,7 +308,7 @@ function process_dictionary(
     schema::AbstractSchema{N},
     dictionary::AbstractVector{Fingerprint{N,M}},
     schemas::AbstractMatrix{Schema{N,M}};
-    batchsize = 8,
+    batchsize = 16,
     target = dictionary,
 ) where {N,M}
     scores = Vector{Tuple{Int64,Int64}}(undef, length(dictionary))
@@ -303,7 +321,7 @@ function process_dictionary(
 
     buffers = map(Base.OneTo(Threads.nthreads())) do _
         return (
-            #PushVector{Fingerprint{N,M}}(),
+            PushVector{Fingerprint{N,M}}(),
             #PushVector{Fingerprint{N,M}}(),
         )
     end
@@ -322,7 +340,7 @@ function process_dictionary(
             # Process this batch
             for i = start:stop
                 maxpartition[] = 0
-                maxsize, maxheight = (CountMatches{0}())(
+                maxsize, maxheight = (CountMatches{1}())(
                     abort,
                     schema,
                     i,
@@ -340,8 +358,7 @@ function process_dictionary(
                 scores[i] = (maxsize, maxheight)
             end
 
-            batch = workcount[] - Threads.nthreads()
-            @show batch, numbatches, best_bound[]
+            ProgressMeter.next!(meter; step = length(start:stop))
         end
     end
     ProgressMeter.finish!(meter)

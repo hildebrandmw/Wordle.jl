@@ -1,4 +1,4 @@
-function newgame(wordlength::Integer, file; hardmode = false, original_guess = nothing)
+function newgame(wordlength::Integer, file; hardmode = false, original_guess = nothing, target = nothing)
     # Read in the dictionary and filter the the appropriate length.
     d = Tuple.(map.(ASCIIChar, collect.((tolength(wordlength, readwords(file))))))
     @show typeof(d)
@@ -7,8 +7,15 @@ function newgame(wordlength::Integer, file; hardmode = false, original_guess = n
         @assert length(original_guess) == wordlength
         original_guess = Fingerprint(Tuple(ASCIIChar.(collect(original_guess))))
     end
+
+    if target !== nothing
+        target = Tuple.(map.(ASCIIChar, collect.((tolength(wordlength, readwords(target))))))
+        target = DataStructures.OrderedSet(target)
+    else
+        target = DataStructures.OrderedSet(d)
+    end
     Random.shuffle!(d)
-    return newgame(d; hardmode, original_guess)
+    return newgame(d; hardmode, original_guess, _target = target,)
 end
 
 function newgame(
@@ -18,8 +25,8 @@ function newgame(
     _target = DataStructures.OrderedSet(_dictionary),
 ) where {N}
     dictionary = Fingerprint.(_dictionary)
-
     target = Fingerprint.(_target)
+
     schema = EmptySchema{N}()
     schemas = @time generate_schemas(_dictionary)
     first_iteration = true
